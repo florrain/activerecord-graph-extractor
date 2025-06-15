@@ -2,11 +2,14 @@
 
 module ActiveRecordGraphExtractor
   class DryRunAnalyzer
-    attr_reader :config, :relationship_analyzer
+    attr_reader :config, :relationship_analyzer, :model_count_cache, :relationship_count_cache, :sample_record_cache
 
     def initialize(config = ActiveRecordGraphExtractor.configuration)
       @config = config
       @relationship_analyzer = RelationshipAnalyzer.new(config)
+      @model_count_cache = {}        # Cache for model.count queries
+      @relationship_count_cache = {} # Cache for relationship count estimates
+      @sample_record_cache = {}      # Cache for sample records
     end
 
     def analyze(root_objects, options = {})
@@ -134,10 +137,61 @@ module ActiveRecordGraphExtractor
     end
 
     def estimate_relationship_count(model_class, relationship_name, relationship_info)
-      # Try to get a sample record to estimate relationship sizes
-      sample_record = model_class.first
-      return 0 unless sample_record
+      # Create cache key for this specific relationship
+      cache_key = "#{model_class.name}##{relationship_name}"
+      
+      # Return cached result if available
+      return @relationship_count_cache[cache_key] if @relationship_count_cache.key?(cache_key)
 
+      # Get cached sample record or fetch and cache it
+      sample_record = get_cached_sample_record(model_class)
+      
+      result = if sample_record.nil?
+        0
+      else
+        calculate_relationship_estimate(model_class, relationship_name, relationship_info, sample_record)
+      end
+
+      # Cache the result
+      @relationship_count_cache[cache_key] = result
+      result
+    end
+
+    def get_cached_sample_record(model_class)
+      model_name = model_class.name
+      
+      # Return cached sample record if available
+      return @sample_record_cache[model_name] if @sample_record_cache.key?(model_name)
+      
+      # Fetch and cache sample record (or nil if none exists)
+      sample_record = begin
+        model_class.first
+      rescue StandardError
+        nil
+      end
+      
+      @sample_record_cache[model_name] = sample_record
+      sample_record
+    end
+
+    def get_cached_model_count(model_class)
+      model_name = model_class.name
+      
+      # Return cached count if available
+      return @model_count_cache[model_name] if @model_count_cache.key?(model_name)
+      
+      # Fetch and cache model count
+      count = begin
+        model_class.count
+      rescue StandardError
+        0
+      end
+      
+      @model_count_cache[model_name] = count
+      count
+    end
+
+    def calculate_relationship_estimate(model_class, relationship_name, relationship_info, sample_record)
       begin
         case relationship_info['type']
         when 'has_many', 'has_and_belongs_to_many'
@@ -145,8 +199,8 @@ module ActiveRecordGraphExtractor
           related_records = sample_record.public_send(relationship_name)
           if related_records.respond_to?(:count)
             sample_count = related_records.limit(100).count
-            # Estimate total based on sample (with some reasonable assumptions)
-            total_records = model_class.count
+            # Use cached total record count
+            total_records = get_cached_model_count(model_class)
             return 0 if total_records == 0
             
             # Use sample count as average, but cap at reasonable limits
@@ -155,15 +209,34 @@ module ActiveRecordGraphExtractor
           end
         when 'has_one', 'belongs_to'
           # For singular relationships, estimate 1 per parent record
-          total_records = model_class.count
+          total_records = get_cached_model_count(model_class)
           return (total_records * 0.9).to_i # 90% factor assuming some records might not have the relationship
         end
       rescue StandardError
         # If we can't estimate, return a conservative estimate
-        return model_class.count > 0 ? [model_class.count / 10, 1].max : 0
+        total_records = get_cached_model_count(model_class)
+        return total_records > 0 ? [total_records / 10, 1].max : 0
       end
 
       0
+    end
+
+    # Clear all caches (useful for testing or memory management)
+    def clear_cache!
+      @model_count_cache.clear
+      @relationship_count_cache.clear
+      @sample_record_cache.clear
+    end
+
+    # Get cache statistics for debugging
+    def cache_stats
+      {
+        model_count_cache_size: @model_count_cache.size,
+        relationship_count_cache_size: @relationship_count_cache.size,
+        sample_record_cache_size: @sample_record_cache.size,
+        cached_models: @model_count_cache.keys,
+        cached_relationships: @relationship_count_cache.keys
+      }
     end
 
     def estimate_file_size(model_counts, relationship_map)

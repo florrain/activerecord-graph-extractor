@@ -8,6 +8,7 @@ module ActiveRecordGraphExtractor
       @config = config
       @visited_models = Set.new
       @circular_paths = []
+      @primary_connection = ActiveRecord::Base.connection
     end
 
     def analyze_model(model_class)
@@ -25,12 +26,21 @@ module ActiveRecordGraphExtractor
           relationship_name = association.name.to_s
           next unless config.relationship_included?(relationship_name)
 
-          model_name = association.klass.name
+          # Check if the associated model uses the primary database
+          associated_model = association.klass
+          model_name = associated_model.name
+          
+          # Skip if model is excluded
           next unless config.model_included?(model_name)
+          
+          # Skip if the associated model doesn't use the primary database (if enabled)
+          if config.skip_non_primary_database_models
+            next unless uses_primary_database?(associated_model)
+          end
 
           relationships[relationship_name] = {
             'type' => association.macro.to_s,
-            'model_class' => association.klass,
+            'model_class' => associated_model,
             'model_name' => model_name,
             'foreign_key' => association.foreign_key,
             'polymorphic' => association.options[:polymorphic] || false,
@@ -41,6 +51,13 @@ module ActiveRecordGraphExtractor
             next
           else
             raise e
+          end
+        rescue StandardError => e
+          # Skip associations that cause database connection errors
+          if e.message.include?('Unknown database') || e.message.include?('database connection')
+            next
+          else
+            raise e unless config.skip_missing_models
           end
         end
       end
@@ -101,7 +118,7 @@ module ActiveRecordGraphExtractor
           end
         end
 
-        dependency_graph[model_class] = dependencies
+        dependency_graph[model_class] = dependencies.uniq
       end
 
       dependency_graph
@@ -112,6 +129,61 @@ module ActiveRecordGraphExtractor
     end
 
     private
+
+    def uses_primary_database?(model_class)
+      begin
+        # Check if the model inherits from a non-primary database class
+        return false if inherits_from_non_primary_database?(model_class)
+        
+        # Get the model's connection
+        model_connection = model_class.connection
+        
+        # Compare connection configurations
+        primary_config = @primary_connection.instance_variable_get(:@config) || {}
+        model_config = model_connection.instance_variable_get(:@config) || {}
+        
+        # Check if they're the same connection object
+        return true if model_connection == @primary_connection
+        
+        # Check if they have the same database configuration
+        if primary_config.any? && model_config.any?
+          # Compare key connection parameters
+          same_database = primary_config[:database] == model_config[:database]
+          same_host = (primary_config[:host] || 'localhost') == (model_config[:host] || 'localhost')
+          same_port = (primary_config[:port] || 5432) == (model_config[:port] || 5432)
+          
+          return same_database && same_host && same_port
+        end
+        
+        # If we can't determine, check if the connection pool is the same
+        primary_pool = ActiveRecord::Base.connection_pool
+        model_pool = model_class.connection_pool
+        
+        return primary_pool == model_pool
+        
+      rescue StandardError => e
+        # If any error occurs (including database connection errors), assume it's not the primary database
+        return false
+      end
+    end
+
+    def inherits_from_non_primary_database?(model_class)
+      # Check if the model inherits from known non-primary database classes
+      non_primary_classes = [
+        'Ops::ReplicaDatabase',
+        'Analytics::Base',
+        'Reporting::Base',
+        'DataWarehouse::Base',
+        'External::Base',
+        'ThirdParty::Base'
+      ]
+      
+      ancestors = model_class.ancestors.map(&:name).compact
+      non_primary_classes.any? { |non_primary_class| ancestors.include?(non_primary_class) }
+    rescue StandardError
+      # If we can't determine the ancestry, err on the side of caution
+      false
+    end
 
     def filter_relationships(relationships)
       relationships.select do |name, info|
@@ -128,6 +200,11 @@ module ActiveRecordGraphExtractor
       
       return false unless config.model_included?(association.klass.name)
       
+      # Check if the associated model uses the primary database (if enabled)
+      if config.skip_non_primary_database_models
+        return false unless uses_primary_database?(association.klass)
+      end
+      
       # Skip polymorphic associations that can't be resolved
       return false if association.polymorphic? && association.foreign_type.nil?
       
@@ -135,6 +212,12 @@ module ActiveRecordGraphExtractor
     rescue NameError
       # Skip associations that reference non-existent models
       false
+    rescue StandardError => e
+      # Skip associations that cause database connection errors
+      if e.message.include?('Unknown database') || e.message.include?('database connection')
+        return false
+      end
+      raise e unless config.skip_missing_models
     end
 
     def build_relationship_info(association)

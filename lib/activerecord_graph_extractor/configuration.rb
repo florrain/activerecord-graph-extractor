@@ -6,7 +6,7 @@ module ActiveRecordGraphExtractor
                   :validate_records, :use_transactions, :handle_circular_references,
                   :skip_missing_models, :included_models, :excluded_models,
                   :included_relationships, :excluded_relationships,
-                  :custom_serializers, :primary_key_strategy
+                  :custom_serializers, :primary_key_strategy, :skip_non_primary_database_models
 
     def initialize
       reset!
@@ -21,6 +21,7 @@ module ActiveRecordGraphExtractor
       @use_transactions = true
       @handle_circular_references = true
       @skip_missing_models = true
+      @skip_non_primary_database_models = true
       @included_models = []
       @excluded_models = []
       @included_relationships = []
